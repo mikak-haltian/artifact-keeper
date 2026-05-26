@@ -4,8 +4,11 @@
 //! Okta, Azure AD, ADFS, Shibboleth, etc.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::Arc;
 
+use flate2::write::DeflateEncoder;
+use flate2::Compression;
 use quick_xml::escape::unescape;
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -167,6 +170,37 @@ pub struct SamlAssertion {
     pub audiences: Vec<String>,
     /// Attributes
     pub attributes: HashMap<String, Vec<String>>,
+}
+
+/// Normalize a certificate to RFC 7468-compliant PEM format.
+///
+/// `bergshamra` uses `pem_rfc7468` which enforces strict RFC 7468 compliance,
+/// requiring base64 lines of at most 64 characters. IdP certificates (e.g. from
+/// Azure AD) commonly use 76- or 80-character lines and will be rejected otherwise.
+///
+/// This function also handles:
+/// - Literal `\n` escape sequences from YAML/JSON/env-var storage.
+/// - Raw base64 DER input (no PEM headers).
+fn normalize_pem_certificate(cert: &str) -> String {
+    // Replace literal \n (backslash + n, two chars) with actual newline
+    let cert = cert.replace("\\n", "\n");
+
+    // Strip any existing PEM headers and collect the raw base64 into one string
+    let base64_data: String = cert
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("-----"))
+        .collect();
+
+    // Re-wrap to exactly 64-character lines (RFC 7468 §2)
+    let wrapped = base64_data
+        .as_bytes()
+        .chunks(64)
+        .map(|chunk| std::str::from_utf8(chunk).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", wrapped)
 }
 
 /// Helper to extract a named XML attribute value from a quick_xml element's attributes.
@@ -479,8 +513,15 @@ impl SamlService {
             sp_entity_id = self.config.sp_entity_id,
         );
 
-        // Base64 encode and URL encode the request
-        let encoded_request = base64_encode(authn_request.as_bytes());
+        // DEFLATE compress, then base64 encode, then URL encode (per SAML HTTP-Redirect binding spec)
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(authn_request.as_bytes()).map_err(|e| {
+            AppError::Internal(format!("Failed to deflate SAML request: {}", e))
+        })?;
+        let compressed = encoder.finish().map_err(|e| {
+            AppError::Internal(format!("Failed to finish deflate SAML request: {}", e))
+        })?;
+        let encoded_request = base64_encode(&compressed);
         let url_encoded_request = urlencoding::encode(&encoded_request);
         let url_encoded_relay_state = urlencoding::encode(&relay_state);
 
@@ -615,7 +656,8 @@ impl SamlService {
 
         // XML digital signature verification using bergshamra
         if let Some(ref idp_cert_pem) = self.config.idp_certificate {
-            let key = bergshamra::keys::loader::load_x509_cert_pem(idp_cert_pem.as_bytes())
+            let normalized_cert = normalize_pem_certificate(idp_cert_pem);
+            let key = bergshamra::keys::loader::load_x509_cert_pem(normalized_cert.as_bytes())
                 .map_err(|e| {
                     AppError::Authentication(format!("Failed to parse IdP certificate: {}", e))
                 })?;

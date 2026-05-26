@@ -504,8 +504,8 @@ pub async fn saml_login(
     // Create SSO session for CSRF
     let _session = AuthConfigService::create_sso_session(&state.db, "saml", id).await?;
 
-    // Build ACS URL
-    let acs_url = format!("/api/v1/auth/sso/saml/{}/acs", id);
+    // Build ACS URL (must be an absolute URI for SAML spec compliance)
+    let acs_url = format!("{}/api/v1/auth/sso/saml/{}/acs", state.config.peer_public_endpoint, id);
 
     // Create SAML service from DB config
     let saml_svc = SamlService::from_db_config(
@@ -560,8 +560,8 @@ pub async fn saml_acs(
     // Get SAML config from DB
     let row = AuthConfigService::get_saml_decrypted(&state.db, id).await?;
 
-    // Build ACS URL
-    let acs_url = format!("/api/v1/auth/sso/saml/{}/acs", id);
+    // Build ACS URL (must be an absolute URI for SAML spec compliance)
+    let acs_url = format!("{}/api/v1/auth/sso/saml/{}/acs", state.config.peer_public_endpoint, id);
 
     // Create SAML service
     let saml_svc = SamlService::from_db_config(
